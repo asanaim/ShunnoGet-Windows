@@ -1,6 +1,6 @@
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
-    id: "shunnoget-download",
+    id: "shunnoget-rust-download",
     title: "⚡ Download with Shunno Get",
     contexts: ["link", "video", "audio"]
   });

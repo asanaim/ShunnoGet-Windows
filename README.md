@@ -1,25 +1,21 @@
-# Shunno Get for Windows (শূন্য গেট)
+# Shunno Get for Windows — Native Rust Edition (শূন্য গেট)
 
-**Shunno Get for Windows** is a fast, 100% free, open-source, multi-threaded desktop download manager modeled after Internet Download Manager (IDM) and wrapped in a clean Apple-inspired Cupertino UI.
+**Shunno Get (Rust Edition)** is an ultra-lightweight (~6 MB), zero-bloat, 32-thread desktop download manager for Windows 10 & 11 built in pure **Rust** (`tokio` + `reqwest` + `eframe`/`egui`) with an Apple Cupertino UI.
 
-## 💻 1-Click Direct Download for Windows 10 & 11
-- **[👉 Download ShunnoGet-Portable.exe (Standalone Single-File EXE)](https://github.com/asanaim/ShunnoGet-Windows/releases/latest/download/ShunnoGet-Portable.exe)**
-- **[Download ShunnoGet-Light.exe (Ultra-Small, requires .NET 8 Desktop Runtime)](https://github.com/asanaim/ShunnoGet-Windows/releases/latest/download/ShunnoGet-Light.exe)**
+## 🦀 Why the Rust Edition?
+- **Tiny ~6 MB Single-File `.exe`:** Compiles directly to native x86_64 machine code (`ShunnoGet.exe`) with zero `.NET`, Java, or WebView/Electron runtime required.
+- **Ultra-Low Memory Footprint (<20 MB RAM):** Uses OS-level positioned file writes (`FileExt::seek_write`) so all 32 concurrent Tokio streams write directly to their byte offsets on disk without lock contention or memory bloat.
+- **Zero-Dependency Native TLS:** Uses Windows SChannel via `reqwest` (`native-tls`) for instant TLS handshakes.
 
----
+## 💻 1-Click Direct Download
+- **[👉 Download ShunnoGet.exe (Standalone Native Rust EXE)](https://github.com/asanaim/ShunnoGet-Windows/releases/latest/download/ShunnoGet.exe)**
 
 ## ✨ Key Features
-1. **Up to 32 Parallel HTTP Range Threads (`MultiThreadEngine.cs`):**
-   - Probes servers via `HEAD` and ranged `GET(0-0)`, pre-allocates the file on disk, and splits downloads across up to **32 concurrent byte-range threads** writing directly via thread-safe `RandomAccess.WriteAsync`.
-   - Includes a live visual segment map (`[████▓▓▒▒]`) showing individual chunk progress in real time.
-2. **True Byte-Offset Pause, Resume & Expired Link Repair (`Fix Link`):**
-   - Saves thread byte offsets in `%LocalAppData%\ShunnoGet\parts` and persists your queue in `shunnoget_queue.json`.
-   - Click **Fix Link** on any paused or interrupted download to paste a fresh CDN URL and resume without losing already-downloaded bytes.
+1. **Up to 32 Parallel HTTP Range Threads (`src/engine.rs`):**
+   - Probes servers via `HEAD` and fallback ranged `GET (bytes=0-0)`, pre-allocates the `.part` file, and spawns up to 32 concurrent Tokio tasks writing via `FileExt::seek_write` with a live visual segment map (`[████▓▓▒▒]`).
+2. **True Pause, Resume & Expired Link Repair (`Fix Link`):**
+   - Checkpoints per-thread byte offsets in `%LocalAppData%\ShunnoGet\parts` and saves queue state in `shunnoget_queue.json`.
 3. **HLS (`.m3u8`) Stream Grabber & Lossless Audio (`FLAC` / `ALAC`):**
-   - Automatically parses `.m3u8` master and media playlists, selects the highest-bitrate stream variant, and merges segments into `.mp4`.
-   - Preserves bit-perfect `.flac`, `.m4a` (ALAC), `.wav`, `.mp4`, `.zip`, `.iso`, and `.exe` files neatly organized into `Downloads\ShunnoGet\<Category>`.
-4. **Live Clipboard Sniffer & Browser Extension Integration:**
-   - **Auto-Sniff Clipboard:** Automatically detects copied download URLs (`.zip`, `.mp4`, `.flac`, `.exe`, `.iso`, `.pdf`) on your Windows clipboard.
-   - **Browser Extension (`browser-extension/`):** Load the unpacked extension in Chrome, Edge, or Brave to right-click any link or media stream and select **"⚡ Download with Shunno Get"** (passes `Referer` headers directly to `http://127.0.0.1:45780/add`).
-5. **Wildcard Batch Grabber, Speed Limiter & SHA-256 Verifier:**
-   - Expand sequential URLs with `[01-50]` syntax or import `.txt` link lists, throttle bandwidth (`10 MB/s`, `5 MB/s`, `2 MB/s`, `512 KB/s`), and automatically verify every completed download with a **SHA-256** checksum.
+   - Parses `.m3u8` master/media playlists, downloads the highest-bitrate variant stream into `.mp4`, and routes `.flac`, `.m4a`, `.wav`, `.mp4`, `.zip`, and `.exe` files into `Downloads\ShunnoGet\<Category>`.
+4. **Live Clipboard Sniffer, Browser Extension & SHA-256 Checksums:**
+   - Automatically captures copied download URLs from your Windows clipboard, listens on `http://127.0.0.1:45780/add` for the included Chrome/Edge/Brave extension (`browser-extension/`), expands `[01-50]` wildcard batches, throttles bandwidth, and computes a **SHA-256** digest for every finished download.

@@ -1,0 +1,36 @@
+[package]
+name = "shunno-get"
+version = "1.0.0"
+edition = "2021"
+description = "Shunno Get — Native Rust Multi-Threaded Download Manager with Apple Cupertino UI"
+build = "build.rs"
+
+[[bin]]
+name = "ShunnoGet"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.27.2", default-features = false, features = ["default_fonts", "glow"] }
+egui = "=0.27.2"
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
+reqwest = { version = "0.12.5", default-features = false, features = ["native-tls", "stream", "gzip"] }
+futures-util = "0.3.30"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.8"
+hex = "0.4.3"
+arboard = "3.4.0"
+rfd = "0.14.1"
+url = "2.5.2"
+regex = "1.10.5"
+rand = "0.8.5"
+dirs = "5.0.1"
+
+[build-dependencies]
+winres = "0.1.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Shunno Get Browser Integration",
+  "name": "Shunno Get (Rust) Browser Integration",
   "version": "1.0.0",
-  "description": "Send downloads, cookies, and referer headers directly to Shunno Get on Windows.",
+  "description": "Send downloads and referer headers directly to Shunno Get (Rust) on Windows.",
   "permissions": ["contextMenus", "activeTab"],
   "background": {
     "service_worker": "background.js"

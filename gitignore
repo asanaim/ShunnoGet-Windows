@@ -1,7 +1,4 @@
-bin/
-obj/ 
-.vs/
-*.user
-*.suo
-publish/
+/target
+Cargo.lock
 release-exe/
+.DS_Store
