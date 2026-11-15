@@ -38,7 +38,7 @@ jobs:
           make_latest: true
           body: |
             ### 🦀 Direct 1-Click Download for Windows 10 & 11 (Native Rust)
-            Ultra-lightweight (~6 MB), standalone native Rust executable with zero external runtime dependencies and <20 MB RAM usage:
+            Ultra-lightweight (~6 MB), standalone native Rust executable with zero external runtime dependencies:
             - **[👉 Download ShunnoGet.exe (Standalone Native Rust EXE)](https://github.com/${{ github.repository }}/releases/latest/download/ShunnoGet.exe)**
           files: |
             release-exe/ShunnoGet.exe
