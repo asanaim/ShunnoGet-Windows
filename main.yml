@@ -2,7 +2,7 @@ name: Build Shunno Get Windows EXE
 
 on: [push, workflow_dispatch]
 
-permissions:
+permissions: 
   contents: write
 
 jobs:
