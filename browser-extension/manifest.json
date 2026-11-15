@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Shunno Get Browser Integration",
+  "version": "1.0.0",
+  "description": "Send downloads, cookies, and referer headers directly to Shunno Get on Windows.",
+  "permissions": ["contextMenus", "activeTab"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

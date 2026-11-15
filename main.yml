@@ -1,0 +1,53 @@
+name: Build Shunno Get Windows EXE
+
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Self-Contained Single-File Portable EXE (Zero Runtime Needed)
+        run: |
+          dotnet publish ShunnoGet/ShunnoGet.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish-portable
+          mkdir release-exe
+          copy publish-portable\ShunnoGet.exe release-exe\ShunnoGet-Portable.exe
+
+      - name: Build Lightweight EXE (Framework-Dependent)
+        run: |
+          dotnet publish ShunnoGet/ShunnoGet.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish-light
+          copy publish-light\ShunnoGet.exe release-exe\ShunnoGet-Light.exe
+
+      - name: Upload ShunnoGet Windows EXE Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShunnoGet-Windows-EXE
+          path: release-exe/*.exe
+
+      - name: Publish 1-Click Direct Download Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Shunno Get for Windows v1.0 (1-Click Portable EXE)"
+          make_latest: true
+          body: |
+            ### 💻 Direct 1-Click Download for Windows 10 & 11 (64-bit)
+            Download and run **Shunno Get** immediately—no installation or .NET runtime required:
+            - **[👉 Download ShunnoGet-Portable.exe (Standalone All-in-One)](https://github.com/${{ github.repository }}/releases/latest/download/ShunnoGet-Portable.exe)**
+            - **[Download ShunnoGet-Light.exe (Ultra-Small, uses installed .NET 8)](https://github.com/${{ github.repository }}/releases/latest/download/ShunnoGet-Light.exe)**
+          files: |
+            release-exe/ShunnoGet-Portable.exe
+            release-exe/ShunnoGet-Light.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
