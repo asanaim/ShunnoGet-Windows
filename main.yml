@@ -1,6 +1,11 @@
-name: Build Shunno Get Rust Windows EXE
+name: Build Shunno Browser Full Rust Windows EXE
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,26 +26,26 @@ jobs:
       - name: Prepare Release EXE
         run: |
           mkdir release-exe
-          copy target\release\ShunnoGet.exe release-exe\ShunnoGet.exe
+          copy target\release\ShunnoBrowser.exe release-exe\ShunnoBrowser.exe
 
-      - name: Upload ShunnoGet Windows EXE Artifact
+      - name: Upload ShunnoBrowser Windows EXE Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ShunnoGet-Rust-Windows-EXE
-          path: release-exe/ShunnoGet.exe
+          name: ShunnoBrowser-Full-Rust-Windows-EXE
+          path: release-exe/ShunnoBrowser.exe
 
       - name: Publish 1-Click Direct Download Release
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: "Shunno Get v1.0 (Native Rust Windows EXE)"
+          name: "Shunno Browser v1.0 for Windows (Full NBPro + Brave Audio + 32-Thread Shunno Get)"
           make_latest: true
           body: |
             ### 🦀 Direct 1-Click Download for Windows 10 & 11 (Native Rust)
-            Ultra-lightweight (~6 MB), standalone native Rust executable with zero external runtime dependencies:
-            - **[👉 Download ShunnoGet.exe (Standalone Native Rust EXE)](https://github.com/${{ github.repository }}/releases/latest/download/ShunnoGet.exe)**
+            Full-featured Naked Browser Pro alternative built in pure Rust + Edge WebView2 with multi-tab browsing, Incognito tabs, Brave-style background YouTube audio, SponsorBlock, per-site JS/Image/Desktop/OLED toggles, UserScripts, portable bookmarks, and built-in 32-thread Shunno Get downloads:
+            - **[👉 Download ShunnoBrowser.exe](https://github.com/${{ github.repository }}/releases/latest/download/ShunnoBrowser.exe)**
           files: |
-            release-exe/ShunnoGet.exe
+            release-exe/ShunnoBrowser.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

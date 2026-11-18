@@ -1,21 +1,18 @@
-# Shunno Get for Windows — Native Rust Edition (শূন্য গেট)
+# Shunno Browser for Windows — Full-Featured Native Rust Edition (শূন্য ব্রাউজার)
 
-**Shunno Get (Rust Edition)** is an ultra-lightweight (~6 MB), zero-bloat, 32-thread desktop download manager for Windows 10 & 11 built in pure **Rust** (`tokio` + `reqwest` + `eframe`/`egui`) with an Apple Cupertino UI.
-
-## 🦀 Why the Rust Edition?
-- **Tiny ~6 MB Single-File `.exe`:** Compiles directly to native x86_64 machine code (`ShunnoGet.exe`) with zero `.NET`, Java, or WebView/Electron runtime required.
-- **Ultra-Low Memory Footprint (<20 MB RAM):** Uses OS-level positioned file writes (`FileExt::seek_write`) so all 32 concurrent Tokio streams write directly to their byte offsets on disk without lock contention or memory bloat.
-- **Zero-Dependency Native TLS:** Uses Windows SChannel via `reqwest` (`native-tls`) for instant TLS handshakes.
+**Shunno Browser** is a featherweight (~5.5 MB), zero-telemetry desktop browser and 32-thread download manager for Windows 10 & 11 built in pure **Rust** (`tao` + `wry` Edge WebView2 + `tokio` + `reqwest`) with an Apple Cupertino UI.
 
 ## 💻 1-Click Direct Download
-- **[👉 Download ShunnoGet.exe (Standalone Native Rust EXE)](https://github.com/asanaim/ShunnoGet-Windows/releases/latest/download/ShunnoGet.exe)**
+- **[👉 Download ShunnoBrowser.exe](https://github.com/asanaim/ShunnoBrowser-Windows/releases/latest/download/ShunnoBrowser.exe)**
 
-## ✨ Key Features
-1. **Up to 32 Parallel HTTP Range Threads (`src/engine.rs`):**
-   - Probes servers via `HEAD` and fallback ranged `GET (bytes=0-0)`, pre-allocates the `.part` file, and spawns up to 32 concurrent Tokio tasks writing via `FileExt::seek_write` with a live visual segment map (`[████▓▓▒▒]`).
-2. **True Pause, Resume & Expired Link Repair (`Fix Link`):**
-   - Checkpoints per-thread byte offsets in `%LocalAppData%\ShunnoGet\parts` and saves queue state in `shunnoget_queue.json`.
-3. **HLS (`.m3u8`) Stream Grabber & Lossless Audio (`FLAC` / `ALAC`):**
-   - Parses `.m3u8` master/media playlists, downloads the highest-bitrate variant stream into `.mp4`, and routes `.flac`, `.m4a`, `.wav`, `.mp4`, `.zip`, and `.exe` files into `Downloads\ShunnoGet\<Category>`.
-4. **Live Clipboard Sniffer, Browser Extension & SHA-256 Checksums:**
-   - Automatically captures copied download URLs from your Windows clipboard, listens on `http://127.0.0.1:45780/add` for the included Chrome/Edge/Brave extension (`browser-extension/`), expands `[01-50]` wildcard batches, throttles bandwidth, and computes a **SHA-256** digest for every finished download.
+## ✨ Complete Feature Set Included
+1. **Multi-Tab Cupertino Browser + Incognito Mode + Session Restore:**
+   - Independent Edge WebView2 tabs (`+ Tab`, `🕵 Private`), automatic session persistence (`session.json`), and pop-up window blocking.
+2. **Brave-Style Background YouTube Audio & SponsorBlock:**
+   - Overrides the Page Visibility API (`document.hidden = false`) so YouTube and media streams keep playing seamlessly in background tabs or when minimized, paired with YouTube Shorts/ad-shelf removal and automatic video ad skipping.
+3. **Naked Browser Pro (NBPro) Per-Site Granular Whitelists (`⚙️ Site`):**
+   - Toggle **AdBlock**, **JavaScript**, **Page Images**, **Desktop User-Agent**, **True OLED Dark Mode (`#000000`)**, **SponsorBlock**, and **Auto-Reject Cookie Banners** per domain (`site_policies.json`).
+4. **Power-User Reading & Browsing Tools:**
+   - **Universal HTML5 Video Speed (`⏩ 0.75× – 4.0×`)**, **Clean Cupertino Reader Mode (`📖 Reader`)**, **Find-in-Page (`🔍 Find`)**, **Tracking Parameter Stripper (`utm_*`, `fbclid`, `gclid`, `si`)**, **Custom User-Scripts (`Downloads\ShunnoBrowser\scripts\*.js`)**, and **Portable `.txt` Bookmarks + History (`⭐ Library`)**.
+5. **Integrated 32-Thread Shunno Get Engine (`⚡ Get`):**
+   - Intercepts browser downloads and sniffed media streams (`.mp4`, `.m3u8` HLS, `.flac`, `.m4a` ALAC, `.zip`, `.iso`, `.exe`) across up to **32 parallel HTTP Range threads** (`FileExt::seek_write`), with byte-offset Pause/Resume, **Fix Link** URL repair, **Speed Limiter**, **Wildcard Batch `[01-50]`**, and **SHA-256** verification.

@@ -1,778 +1,820 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod engine;
-mod models;
+mod downloader;
+mod state;
+mod ui_chrome;
 
-use eframe::egui::{
-    self, Color32, FontId, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2, Visuals,
-};
-use engine::DownloadEngine;
-use models::{detect_category, DownloadItem, QueueStorage};
-use rand::Rng;
+use downloader::ShunnoGetDesktop;
 use regex::Regex;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fs;
 use std::process::Command;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use url::Url;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tao::dpi::{LogicalPosition, LogicalSize};
+use tao::event::{Event, WindowEvent};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::window::{Window, WindowBuilder};
+use wry::{Rect, WebView, WebViewBuilder};
 
-const SNIFF_EXTENSIONS: &[&str] = &[
-    ".zip", ".7z", ".rar", ".exe", ".msi", ".iso", ".mp4", ".mkv", ".webm", ".m3u8", ".flac",
-    ".m4a", ".wav", ".mp3", ".pdf", ".apk", ".tar", ".gz",
-];
+use state::{
+    extract_host, sanitize_url, BookmarkEntry, BrowserStorage, GlobalSettings, HistoryEntry,
+    SavedTab, SitePolicy,
+};
 
-fn main() -> eframe::Result<()> {
+const CHROME_BAR_HEIGHT: f64 = 86.0;
+
+enum AppEvent {
+    ChromeIpc(String),
+    ContentIpc(usize, String),
+    DownloadIntercepted(String),
+    NewWindowBlockedOrOpened(String),
+    RefreshChrome,
+}
+
+struct BrowserTab {
+    id: usize,
+    title: String,
+    url: String,
+    incognito: bool,
+    webview: WebView,
+}
+
+#[derive(Serialize)]
+struct TabSummary {
+    id: usize,
+    title: String,
+    url: String,
+    incognito: bool,
+}
+
+#[derive(Serialize)]
+struct ChromeSnapshot {
+    tabs: Vec<TabSummary>,
+    active_tab: usize,
+    active_url: String,
+    active_host: String,
+    site: SitePolicy,
+    global: GlobalSettings,
+    blocked_count: usize,
+    streams: Vec<String>,
+    bookmarks: Vec<BookmarkEntry>,
+    history: Vec<HistoryEntry>,
+    downloads: Vec<downloader::DownloadTask>,
+}
+
+fn build_content_init_script(policy: &SitePolicy, global: &GlobalSettings, user_js: &str) -> String {
+    let mut script = String::new();
+
+    // 1. Brave-Style Background YouTube & Media Playback (Page Visibility API lock)
+    if global.background_youtube_play {
+        script.push_str(
+            r#"
+            (function() {
+                try {
+                    Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+                    Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+                    window.addEventListener('visibilitychange', e => e.stopImmediatePropagation(), true);
+                    document.addEventListener('visibilitychange', e => e.stopImmediatePropagation(), true);
+                } catch(e) {}
+            })();
+            "#,
+        );
+    }
+
+    // 2. Network / Fetch / XHR Media & Lossless Audio Stream Sniffer + Ad/Tracker Blocker
+    let adblock_flag = if policy.adblock { "true" } else { "false" };
+    script.push_str(&format!(
+        r#"
+        (function() {{
+            const ADBLOCK_ON = {adblock_flag};
+            const AD_HOSTS = [
+                'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
+                'adnxs.com', 'adsrvr.org', 'taboola.com', 'outbrain.com',
+                'popads.net', 'popcash.net', 'propellerads.com', 'exoclick.com',
+                'scorecardresearch.com', 'criteo.com', 'pubmatic.com', 'rubiconproject.com'
+            ];
+            const MEDIA_EXTS = ['.mp4', '.m3u8', '.flac', '.m4a', '.wav', '.mp3', '.zip', '.iso', '.exe', '.msi', '.apk'];
+
+            function inspectUrl(raw) {{
+                if (!raw) return false;
+                const str = String(raw);
+                const lower = str.split('?')[0].toLowerCase();
+                if (ADBLOCK_ON && AD_HOSTS.some(h => lower.includes(h))) {{
+                    if (window.ipc) window.ipc.postMessage('AD_BLOCKED');
+                    return true;
+                }}
+                if (MEDIA_EXTS.some(ext => lower.endsWith(ext)) && str.startsWith('http')) {{
+                    if (window.ipc) window.ipc.postMessage('STREAM:' + str);
+                }}
+                return false;
+            }}
+
+            const origFetch = window.fetch;
+            window.fetch = function(input, init) {{
+                const u = (typeof input === 'string') ? input : (input && input.url);
+                if (inspectUrl(u)) return Promise.reject(new Error('Blocked by Shunno AdBlock'));
+                return origFetch.apply(this, arguments);
+            }};
+
+            const origOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {{
+                if (inspectUrl(url)) {{
+                    this._shunnoBlocked = true;
+                    return;
+                }}
+                return origOpen.apply(this, arguments);
+            }};
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function() {{
+                if (this._shunnoBlocked) return;
+                return origSend.apply(this, arguments);
+            }};
+
+            window.addEventListener('DOMContentLoaded', () => {{
+                if (window.ipc) window.ipc.postMessage('META:' + JSON.stringify({{ title: document.title, url: location.href }}));
+                document.querySelectorAll('video source, audio source, video[src], audio[src]').forEach(el => {{
+                    if (el.src) inspectUrl(el.src);
+                }});
+            }});
+        }})();
+        "#
+    ));
+
+    // 3. Per-Site NBPro Controls: JavaScript Gate, Image Blocker, Desktop User-Agent, OLED Force-Dark, SponsorBlock & Cookie Rejector
+    if !policy.js_enabled {
+        script.push_str(
+            r#"
+            (function() {
+                window.addEventListener('DOMContentLoaded', () => {
+                    document.querySelectorAll('script').forEach(s => s.remove());
+                });
+            })();
+            "#,
+        );
+    }
+
+    if !policy.images_enabled {
+        script.push_str(
+            r#"
+            (function() {
+                const st = document.createElement('style');
+                st.textContent = 'img, picture, svg, video[poster], [style*="background-image"] { display: none !important; background-image: none !important; }';
+                document.documentElement.appendChild(st);
+            })();
+            "#,
+        );
+    }
+
+    if policy.desktop_ua {
+        script.push_str(
+            r#"
+            (function() {
+                try {
+                    Object.defineProperty(navigator, 'userAgent', {
+                        get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+                    });
+                } catch(e) {}
+            })();
+            "#,
+        );
+    }
+
+    if policy.oled_dark {
+        script.push_str(
+            r#"
+            (function() {
+                const st = document.createElement('style');
+                st.textContent = 'html, body, div, section, article, main, header, footer, nav, aside { background-color: #000000 !important; color: #E5E5EA !important; border-color: #2C2C2E !important; } a { color: #0A84FF !important; }';
+                document.documentElement.appendChild(st);
+            })();
+            "#,
+        );
+    }
+
+    if policy.adblock || policy.sponsorblock || policy.auto_reject_cookies {
+        let hide_ads = if policy.adblock || policy.sponsorblock {
+            "ytd-reel-shelf-renderer, ytd-rich-section-renderer, .ad-showing, .ytp-ad-module, ins.adsbygoogle, [id^=\"google_ads_\"], [class*=\"taboola\"], [class*=\"outbrain\"] { display: none !important; }"
+        } else {
+            ""
+        };
+        let auto_skip = if policy.sponsorblock { "true" } else { "false" };
+        let reject_cookies = if policy.auto_reject_cookies { "true" } else { "false" };
+
+        script.push_str(&format!(
+            r#"
+            (function() {{
+                const st = document.createElement('style');
+                st.textContent = `{hide_ads}`;
+                document.documentElement.appendChild(st);
+
+                setInterval(() => {{
+                    if ({auto_skip}) {{
+                        const sk = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+                        if (sk) sk.click();
+                        const v = document.querySelector('video');
+                        if (v && document.querySelector('.ad-showing')) {{
+                            v.playbackRate = 16.0;
+                            v.muted = true;
+                        }}
+                    }}
+                    if ({reject_cookies}) {{
+                        document.querySelectorAll('[id*="reject"], [class*="reject"], #onetrust-reject-all-handler, .fc-cta-do-not-consent').forEach(b => b.click());
+                    }}
+                }}, 900);
+            }})();
+            "#
+        ));
+    }
+
+    // 4. Custom User-Scripts (Downloads/ShunnoBrowser/scripts/*.js)
+    if !user_js.is_empty() {
+        script.push_str(user_js);
+    }
+
+    script
+}
+
+fn create_tab_webview(
+    window: &Window,
+    tab_id: usize,
+    url: &str,
+    policy: &SitePolicy,
+    global: &GlobalSettings,
+    proxy: EventLoopProxy<AppEvent>,
+    drawer_open: bool,
+) -> wry::Result<WebView> {
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let content_h = (size.height - CHROME_BAR_HEIGHT).max(100.0);
+    let host = extract_host(url);
+    let user_js = BrowserStorage::load_matching_user_scripts(&host);
+    let init_script = build_content_init_script(policy, global, &user_js);
+
+    let ipc_proxy = proxy.clone();
+    let dl_proxy = proxy.clone();
+    let win_proxy = proxy.clone();
+
+    let wv = WebViewBuilder::new_as_child(window)
+        .with_bounds(Rect {
+            position: LogicalPosition::new(0.0, CHROME_BAR_HEIGHT).into(),
+            size: LogicalSize::new(size.width.max(400.0), content_h).into(),
+        })
+        .with_url(url)
+        .with_initialization_script(&init_script)
+        .with_ipc_handler(move |req| {
+            let _ = ipc_proxy.send_event(AppEvent::ContentIpc(tab_id, req.body().clone()));
+        })
+        .with_download_started_handler(move |dl_url, _dest| {
+            let _ = dl_proxy.send_event(AppEvent::DownloadIntercepted(dl_url));
+            false // Route to Shunno Get 32-Thread Engine
+        })
+        .with_new_window_req_handler(move |popup_url| {
+            let _ = win_proxy.send_event(AppEvent::NewWindowBlockedOrOpened(popup_url));
+            false
+        })
+        .build()?;
+
+    let _ = wv.set_visible(!drawer_open);
+    Ok(wv)
+}
+
+fn layout_webviews(window: &Window, chrome_wv: &WebView, tabs: &[BrowserTab], active_idx: usize, drawer_open: bool) {
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let w = size.width.max(400.0);
+    let h = size.height.max(300.0);
+
+    let chrome_h = if drawer_open { h } else { CHROME_BAR_HEIGHT };
+    let _ = chrome_wv.set_bounds(Rect {
+        position: LogicalPosition::new(0.0, 0.0).into(),
+        size: LogicalSize::new(w, chrome_h).into(),
+    });
+
+    let content_h = (h - CHROME_BAR_HEIGHT).max(100.0);
+    for (idx, tab) in tabs.iter().enumerate() {
+        let _ = tab.webview.set_bounds(Rect {
+            position: LogicalPosition::new(0.0, CHROME_BAR_HEIGHT).into(),
+            size: LogicalSize::new(w, content_h).into(),
+        });
+        let _ = tab.webview.set_visible(!drawer_open && idx == active_idx);
+    }
+}
+
+fn main() -> wry::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to start Tokio runtime");
-
     let rt_handle = rt.handle().clone();
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([820.0, 560.0])
-            .with_title("Shunno Get (Rust) — Multi-Threaded Download Manager"),
-        ..Default::default()
+    let mut global_settings = BrowserStorage::load_global_settings();
+    let mut site_policies = BrowserStorage::load_site_policies();
+    let mut bookmarks = BrowserStorage::load_bookmarks();
+    let mut history = BrowserStorage::load_history();
+    let engine = Arc::new(ShunnoGetDesktop::new(global_settings.speed_limit_bps));
+
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+
+    let window = WindowBuilder::new()
+        .with_title("Shunno Browser — NBPro + Brave Background Audio + 32-Thread Shunno Get")
+        .with_inner_size(LogicalSize::new(1220.0, 780.0))
+        .build(&event_loop)
+        .unwrap();
+
+    let chrome_proxy = proxy.clone();
+    let chrome_wv = WebViewBuilder::new_as_child(&window)
+        .with_bounds(Rect {
+            position: LogicalPosition::new(0.0, 0.0).into(),
+            size: LogicalSize::new(1220.0, CHROME_BAR_HEIGHT).into(),
+        })
+        .with_html(ui_chrome::CHROME_HTML)
+        .with_ipc_handler(move |req| {
+            let _ = chrome_proxy.send_event(AppEvent::ChromeIpc(req.body().clone()));
+        })
+        .build()?;
+
+    let next_tab_id = Arc::new(AtomicUsize::new(1));
+    let mut tabs: Vec<BrowserTab> = Vec::new();
+    let mut active_tab_idx: usize = 0;
+    let mut drawer_open = false;
+    let mut blocked_count: usize = 0;
+    let mut sniffed_streams: Vec<String> = Vec::new();
+
+    // Restore previous session or open default start page
+    let saved_session = BrowserStorage::load_session();
+    let initial_urls: Vec<String> = if saved_session.is_empty() {
+        vec!["https://duckduckgo.com".to_string()]
+    } else {
+        saved_session.into_iter().map(|t| t.url).collect()
     };
 
-    eframe::run_native(
-        "Shunno Get",
-        native_options,
-        Box::new(move |cc| Box::new(ShunnoGetApp::new(cc, rt_handle))),
-    )
-}
-
-struct ShunnoGetApp {
-    rt_handle: tokio::runtime::Handle,
-    engine: DownloadEngine,
-    queue: Arc<Mutex<Vec<DownloadItem>>>,
-    url_input: String,
-    selected_threads: usize,
-    selected_category: String,
-    speed_limit_idx: usize,
-    clipboard_sniff_enabled: bool,
-    last_clipboard_url: String,
-    last_clip_check: Instant,
-    footer_status: String,
-    fix_link_target_id: Option<u64>,
-    fix_link_input: String,
-}
-
-impl ShunnoGetApp {
-    fn new(cc: &eframe::CreationContext<'_>, rt_handle: tokio::runtime::Handle) -> Self {
-        let mut visuals = Visuals::light();
-        visuals.panel_fill = Color32::from_rgb(242, 242, 247); // Apple #F2F2F7
-        visuals.window_fill = Color32::WHITE;
-        visuals.widgets.noninteractive.bg_fill = Color32::WHITE;
-        visuals.widgets.inactive.rounding = Rounding::same(10.0);
-        visuals.widgets.hovered.rounding = Rounding::same(10.0);
-        visuals.widgets.active.rounding = Rounding::same(10.0);
-        cc.egui_ctx.set_visuals(visuals);
-
-        let initial_items = QueueStorage::load_queue();
-        let queue = Arc::new(Mutex::new(initial_items));
-        let engine = DownloadEngine::new();
-
-        // Start local browser extension hook on http://127.0.0.1:45780/add?url=...
-        start_browser_hook_server(&rt_handle, engine.clone(), queue.clone());
-
-        Self {
-            rt_handle,
-            engine,
-            queue,
-            url_input: String::new(),
-            selected_threads: 16,
-            selected_category: "All".to_string(),
-            speed_limit_idx: 0,
-            clipboard_sniff_enabled: true,
-            last_clipboard_url: String::new(),
-            last_clip_check: Instant::now(),
-            footer_status: "🦀 Rust + Tokio + Reqwest Engine Ready • Listening on http://127.0.0.1:45780/add"
-                .to_string(),
-            fix_link_target_id: None,
-            fix_link_input: String::new(),
+    for u in initial_urls {
+        let host = extract_host(&u);
+        let pol = site_policies.get(&host).cloned().unwrap_or_default();
+        let tid = next_tab_id.fetch_add(1, Ordering::SeqCst);
+        if let Ok(wv) = create_tab_webview(&window, tid, &u, &pol, &global_settings, proxy.clone(), false) {
+            tabs.push(BrowserTab {
+                id: tid,
+                title: u.clone(),
+                url: u,
+                incognito: false,
+                webview: wv,
+            });
         }
     }
 
-    fn enqueue_url(&mut self, raw_url: &str, referer: Option<String>, cookie: Option<String>) {
-        let trimmed = raw_url.trim();
-        let Ok(parsed) = Url::parse(trimmed) else {
-            return;
-        };
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return;
-        }
-
-        let raw_name = parsed
-            .path_segments()
-            .and_then(|s| s.last())
-            .unwrap_or("download.bin");
-        let file_name = if raw_name.contains('.') && !raw_name.is_empty() {
-            raw_name.to_string()
-        } else {
-            format!("download_{}.bin", rand::thread_rng().gen_range(1000..9999))
-        };
-
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(1);
-        let id = now_ms + rand::thread_rng().gen_range(1..999);
-
-        let item = DownloadItem {
-            id,
-            url: parsed.to_string(),
-            file_name: file_name.clone(),
-            total_bytes: -1,
-            downloaded_bytes: 0,
-            status: "DOWNLOADING".to_string(),
-            speed_bytes_per_sec: 0,
-            thread_count: self.selected_threads,
-            category: detect_category(&file_name),
-            supports_ranges: true,
-            referer,
-            cookie,
-            saved_file_path: None,
-            sha256_hash: None,
-            error_message: None,
-            segment_map: String::new(),
-        };
-
-        if let Ok(mut list) = self.queue.lock() {
-            list.insert(0, item.clone());
-            QueueStorage::save_queue(&list);
-        }
-
-        self.engine
-            .start_task(&self.rt_handle, item, self.queue.clone());
-    }
-
-    fn enqueue_batch_or_wildcard(&mut self, input: &str) {
-        let re = Regex::new(r"\[(\d+)-(\d+)\]").unwrap();
-        let lines: Vec<String> = input
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-
-        for line in lines {
-            if let Some(caps) = re.captures(&line) {
-                let start_str = caps.get(1).map(|m| m.as_str()).unwrap_or("1");
-                let end_str = caps.get(2).map(|m| m.as_str()).unwrap_or("1");
-                if let (Ok(start), Ok(end)) = (start_str.parse::<u32>(), end_str.parse::<u32>()) {
-                    let width = start_str.len();
-                    let full_match = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                    for i in start..=end.min(start + 100) {
-                        let num = format!("{:0width$}", i, width = width);
-                        let expanded = line.replace(full_match, &num);
-                        self.enqueue_url(&expanded, None, None);
-                    }
-                    continue;
-                }
-            }
-            self.enqueue_url(&line, None, None);
-        }
-    }
-
-    fn poll_clipboard(&mut self) {
-        if !self.clipboard_sniff_enabled || self.last_clip_check.elapsed() < Duration::from_millis(1200) {
-            return;
-        }
-        self.last_clip_check = Instant::now();
-
-        if let Ok(mut cb) = arboard::Clipboard::new() {
-            if let Ok(text) = cb.get_text() {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() && trimmed != self.last_clipboard_url {
-                    if let Ok(parsed) = Url::parse(trimmed) {
-                        let lower_path = parsed.path().to_ascii_lowercase();
-                        if SNIFF_EXTENSIONS.iter().any(|ext| lower_path.ends_with(ext)) {
-                            self.last_clipboard_url = trimmed.to_string();
-                            if self.url_input.trim().is_empty() {
-                                self.url_input = trimmed.to_string();
-                                self.footer_status =
-                                    format!("📋 Auto-sniffed link from clipboard: {}", trimmed);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn start_browser_hook_server(
-    rt: &tokio::runtime::Handle,
-    engine: DownloadEngine,
-    queue: Arc<Mutex<Vec<DownloadItem>>>,
-) {
-    let handle = rt.clone();
-    rt.spawn(async move {
-        let Ok(listener) = TcpListener::bind("127.0.0.1:45780").await else {
-            return;
-        };
-
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = [0u8; 4096];
-            if let Ok(n) = stream.read(&mut buf).await {
-                let req_str = String::from_utf8_lossy(&buf[..n]);
-                if let Some(first_line) = req_str.lines().next() {
-                    let parts: Vec<&str> = first_line.split_whitespace().collect();
-                    if parts.len() >= 2 && parts[1].starts_with("/add") {
-                        let fake_full = format!("http://127.0.0.1:45780{}", parts[1]);
-                        if let Ok(parsed) = Url::parse(&fake_full) {
-                            let mut target_url = None;
-                            let mut referer = None;
-                            let mut cookie = None;
-                            for (k, v) in parsed.query_pairs() {
-                                match k.as_ref() {
-                                    "url" => target_url = Some(v.into_owned()),
-                                    "referer" => referer = Some(v.into_owned()),
-                                    "cookie" => cookie = Some(v.into_owned()),
-                                    _ => {}
-                                }
-                            }
-                            if let Some(u) = target_url {
-                                if let Ok(valid_url) = Url::parse(&u) {
-                                    let fname = valid_url
-                                        .path_segments()
-                                        .and_then(|s| s.last())
-                                        .unwrap_or("download.bin")
-                                        .to_string();
-                                    let now_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(1);
-                                    let item = DownloadItem {
-                                        id: now_ms + rand::thread_rng().gen_range(1..999),
-                                        url: valid_url.to_string(),
-                                        file_name: fname.clone(),
-                                        total_bytes: -1,
-                                        downloaded_bytes: 0,
-                                        status: "DOWNLOADING".to_string(),
-                                        speed_bytes_per_sec: 0,
-                                        thread_count: 16,
-                                        category: detect_category(&fname),
-                                        supports_ranges: true,
-                                        referer,
-                                        cookie,
-                                        saved_file_path: None,
-                                        sha256_hash: None,
-                                        error_message: None,
-                                        segment_map: String::new(),
-                                    };
-                                    if let Ok(mut list) = queue.lock() {
-                                        list.insert(0, item.clone());
-                                        QueueStorage::save_queue(&list);
-                                    }
-                                    engine.start_task(&handle, item, queue.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                let resp = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\n\r\nOK";
-                let _ = stream.write_all(resp.as_bytes()).await;
-            }
+    // Periodic background refresh timer to keep download progress bars & speeds updated smoothly
+    let ticker_proxy = proxy.clone();
+    rt_handle.spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let _ = ticker_proxy.send_event(AppEvent::RefreshChrome);
         }
     });
-}
 
-impl eframe::App for ShunnoGetApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(250));
-        self.poll_clipboard();
+    let push_chrome_state = |chrome_wv: &WebView,
+                             tabs: &[BrowserTab],
+                             active_idx: usize,
+                             site_policies: &HashMap<String, SitePolicy>,
+                             global_settings: &GlobalSettings,
+                             blocked_count: usize,
+                             sniffed_streams: &[String],
+                             bookmarks: &[BookmarkEntry],
+                             history: &[HistoryEntry],
+                             engine: &ShunnoGetDesktop| {
+        let active_url = tabs.get(active_idx).map(|t| t.url.clone()).unwrap_or_default();
+        let active_host = extract_host(&active_url);
+        let site = site_policies.get(&active_host).cloned().unwrap_or_default();
+        let downloads = engine.tasks.lock().map(|l| l.clone()).unwrap_or_default();
 
-        let apple_blue = Color32::from_rgb(10, 132, 255);
-        let apple_deep_blue = Color32::from_rgb(0, 64, 221);
-        let apple_green = Color32::from_rgb(48, 209, 88);
-        let apple_orange = Color32::from_rgb(255, 159, 10);
-        let apple_red = Color32::from_rgb(255, 59, 48);
-        let text_primary = Color32::from_rgb(28, 28, 30);
-        let text_secondary = Color32::from_rgb(142, 142, 147);
+        let snap = ChromeSnapshot {
+            tabs: tabs
+                .iter()
+                .map(|t| TabSummary {
+                    id: t.id,
+                    title: t.title.clone(),
+                    url: t.url.clone(),
+                    incognito: t.incognito,
+                })
+                .collect(),
+            active_tab: active_idx,
+            active_url,
+            active_host,
+            site,
+            global: global_settings.clone(),
+            blocked_count,
+            streams: sniffed_streams.to_vec(),
+            bookmarks: bookmarks.to_vec(),
+            history: history.to_vec(),
+            downloads,
+        };
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(242, 242, 247))
-                    .inner_margin(egui::Margin::symmetric(22.0, 18.0)),
-            )
-            .show(ctx, |ui| {
-                // 1. Apple Cupertino Header with Sculpted "0↓" Squircle Emblem
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
-                    let painter = ui.painter();
-                    painter.rect_filled(rect, Rounding::same(13.0), apple_blue);
-                    painter.rect_stroke(
-                        rect.shrink(1.0),
-                        Rounding::same(12.0),
-                        Stroke::new(1.5, apple_deep_blue),
-                    );
-                    painter.circle_stroke(
-                        rect.center(),
-                        14.0,
-                        Stroke::new(3.2, Color32::WHITE),
-                    );
-                    painter.text(
-                        rect.center() + Vec2::new(0.0, 1.0),
-                        egui::Align2::CENTER_CENTER,
-                        "↓",
-                        FontId::proportional(20.0),
-                        apple_green,
-                    );
-
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Shunno Get")
-                                .size(25.0)
-                                .strong()
-                                .color(text_primary),
-                        );
-                        ui.label(
-                            RichText::new("Native Rust + Tokio Engine • Up to 32 Range Threads • HLS (.m3u8) • FLAC/ALAC • SHA-256")
-                                .size(12.0)
-                                .color(text_secondary),
-                        );
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let speed_labels = ["Unlimited", "10 MB/s", "5 MB/s", "2 MB/s", "512 KB/s"];
-                        egui::ComboBox::from_id_source("speed_limiter")
-                            .selected_text(format!("Speed: {}", speed_labels[self.speed_limit_idx]))
-                            .show_ui(ui, |ui| {
-                                for (idx, label) in speed_labels.iter().enumerate() {
-                                    if ui
-                                        .selectable_value(&mut self.speed_limit_idx, idx, *label)
-                                        .changed()
-                                    {
-                                        let bps = match idx {
-                                            1 => 10 * 1024 * 1024,
-                                            2 => 5 * 1024 * 1024,
-                                            3 => 2 * 1024 * 1024,
-                                            4 => 512 * 1024,
-                                            _ => 0,
-                                        };
-                                        self.engine.speed_limit_bps.store(bps, Ordering::SeqCst);
-                                    }
-                                }
-                            });
-
-                        ui.add_space(10.0);
-                        ui.checkbox(&mut self.clipboard_sniff_enabled, "📋 Auto-Sniff Clipboard");
-                    });
-                });
-
-                ui.add_space(14.0);
-
-                // 2. URL Input, Thread Count & Batch Controls Card
-                egui::Frame::none()
-                    .fill(Color32::WHITE)
-                    .rounding(Rounding::same(16.0))
-                    .inner_margin(egui::Margin::same(16.0))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(229, 229, 234)))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let input_res = ui.add_sized(
-                                [ui.available_width() - 375.0, 34.0],
-                                egui::TextEdit::singleline(&mut self.url_input).hint_text(
-                                    "Paste HTTP/HTTPS link, .flac/.mp4/.m3u8 stream, or wildcard track_[01-12].flac...",
-                                ),
-                            );
-
-                            egui::ComboBox::from_id_source("thread_selector")
-                                .selected_text(format!("{} Threads", self.selected_threads))
-                                .width(105.0)
-                                .show_ui(ui, |ui| {
-                                    for t in [1usize, 4, 8, 16, 32] {
-                                        ui.selectable_value(
-                                            &mut self.selected_threads,
-                                            t,
-                                            format!("{} Threads", t),
-                                        );
-                                    }
-                                });
-
-                            let start_btn = egui::Button::new(
-                                RichText::new("⚡ Start Download")
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(apple_blue)
-                            .rounding(Rounding::same(10.0))
-                            .min_size(Vec2::new(135.0, 34.0));
-
-                            if ui.add(start_btn).clicked()
-                                || (input_res.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                            {
-                                let raw = self.url_input.clone();
-                                if !raw.trim().is_empty() {
-                                    self.url_input.clear();
-                                    self.enqueue_batch_or_wildcard(&raw);
-                                }
-                            }
-
-                            let batch_btn = egui::Button::new(
-                                RichText::new("📄 .TXT Batch").color(apple_blue).strong(),
-                            )
-                            .fill(Color32::from_rgb(235, 244, 255))
-                            .rounding(Rounding::same(10.0))
-                            .min_size(Vec2::new(105.0, 34.0));
-
-                            if ui.add(batch_btn).clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Text List", &["txt"])
-                                    .pick_file()
-                                {
-                                    if let Ok(content) = std::fs::read_to_string(path) {
-                                        self.enqueue_batch_or_wildcard(&content);
-                                    }
-                                }
-                            }
-                        });
-
-                        ui.add_space(10.0);
-
-                        // Category Filter Pills
-                        ui.horizontal(|ui| {
-                            let categories = [
-                                "All",
-                                "Videos",
-                                "Lossless Audio",
-                                "Archives",
-                                "Programs",
-                                "Documents",
-                            ];
-                            for cat in categories {
-                                let is_sel = self.selected_category == cat;
-                                let pill = egui::Button::new(
-                                    RichText::new(cat)
-                                        .size(12.5)
-                                        .color(if is_sel { Color32::WHITE } else { text_primary }),
-                                )
-                                .fill(if is_sel {
-                                    apple_blue
-                                } else {
-                                    Color32::from_rgb(242, 242, 247)
-                                })
-                                .rounding(Rounding::same(14.0));
-
-                                if ui.add(pill).clicked() {
-                                    self.selected_category = cat.to_string();
-                                }
-                            }
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .link(
-                                            RichText::new("📂 Open Downloads Folder")
-                                                .color(apple_blue)
-                                                .strong(),
-                                        )
-                                        .clicked()
-                                    {
-                                        let dir = QueueStorage::target_folder("");
-                                        let _ = Command::new("explorer.exe").arg(dir).spawn();
-                                    }
-                                },
-                            );
-                        });
-                    });
-
-                ui.add_space(12.0);
-
-                // 3. Scrollable Download Queue
-                let items_snapshot: Vec<DownloadItem> = if let Ok(list) = self.queue.lock() {
-                    list.iter()
-                        .filter(|i| {
-                            self.selected_category == "All" || i.category == self.selected_category
-                        })
-                        .cloned()
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .max_height(ui.available_height() - 28.0)
-                    .show(ui, |ui| {
-                        if items_snapshot.is_empty() {
-                            ui.add_space(90.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    RichText::new(
-                                        "No downloads in this category yet.\nPaste a URL above, copy a link to your clipboard, or right-click in your browser.",
-                                    )
-                                    .size(14.0)
-                                    .color(text_secondary),
-                                );
-                            });
-                        } else {
-                            for item in items_snapshot {
-                                egui::Frame::none()
-                                    .fill(Color32::WHITE)
-                                    .rounding(Rounding::same(14.0))
-                                    .inner_margin(egui::Margin::symmetric(16.0, 12.0))
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(229, 229, 234)))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    RichText::new(&item.file_name)
-                                                        .size(15.0)
-                                                        .strong()
-                                                        .color(text_primary),
-                                                );
-                                                let status_color = match item.status.as_str() {
-                                                    "COMPLETED" => apple_green,
-                                                    "FAILED" => apple_red,
-                                                    "PAUSED" => apple_orange,
-                                                    _ => apple_blue,
-                                                };
-                                                ui.label(
-                                                    RichText::new(item.badge_text())
-                                                        .size(12.0)
-                                                        .color(status_color),
-                                                );
-                                            });
-
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        RichText::new(item.size_progress_text())
-                                                            .size(12.5)
-                                                            .strong()
-                                                            .color(text_secondary),
-                                                    );
-                                                },
-                                            );
-                                        });
-
-                                        ui.add_space(6.0);
-
-                                        // Cupertino Rounded Progress Bar
-                                        let bar_color = if item.status == "COMPLETED" {
-                                            apple_green
-                                        } else {
-                                            apple_blue
-                                        };
-                                        let (bar_rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(ui.available_width(), 8.0),
-                                            Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            bar_rect,
-                                            Rounding::same(4.0),
-                                            Color32::from_rgb(229, 229, 234),
-                                        );
-                                        let fill_w =
-                                            bar_rect.width() * item.progress_fraction().clamp(0.0, 1.0);
-                                        if fill_w > 1.0 {
-                                            let fill_rect = Rect::from_min_size(
-                                                bar_rect.min,
-                                                Vec2::new(fill_w, bar_rect.height()),
-                                            );
-                                            ui.painter().rect_filled(
-                                                fill_rect,
-                                                Rounding::same(4.0),
-                                                bar_color,
-                                            );
-                                        }
-
-                                        ui.add_space(6.0);
-
-                                        // Telemetry & Action Buttons
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(item.telemetry_text())
-                                                    .size(11.5)
-                                                    .color(text_secondary),
-                                            );
-
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new("✕")
-                                                                    .color(apple_red)
-                                                                    .strong(),
-                                                            )
-                                                            .fill(Color32::from_rgb(255, 235, 234)),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        self.engine.pause_task(item.id);
-                                                        if let Ok(mut list) = self.queue.lock() {
-                                                            list.retain(|i| i.id != item.id);
-                                                            QueueStorage::save_queue(&list);
-                                                        }
-                                                    }
-
-                                                    if item.status == "COMPLETED" {
-                                                        if ui
-                                                            .add(
-                                                                egui::Button::new(
-                                                                    RichText::new("Show File")
-                                                                        .color(apple_green)
-                                                                        .strong(),
-                                                                )
-                                                                .fill(Color32::from_rgb(
-                                                                    232, 248, 238,
-                                                                )),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            if let Some(ref path) =
-                                                                item.saved_file_path
-                                                            {
-                                                                let _ = Command::new("explorer.exe")
-                                                                    .arg(format!(
-                                                                        "/select,{}",
-                                                                        path
-                                                                    ))
-                                                                    .spawn();
-                                                            }
-                                                        }
-                                                    } else {
-                                                        if ui
-                                                            .add(
-                                                                egui::Button::new(
-                                                                    RichText::new("Fix Link")
-                                                                        .color(text_primary),
-                                                                )
-                                                                .fill(Color32::from_rgb(
-                                                                    242, 242, 247,
-                                                                )),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.fix_link_target_id = Some(item.id);
-                                                            self.fix_link_input = item.url.clone();
-                                                        }
-
-                                                        if item.status == "DOWNLOADING" {
-                                                            if ui
-                                                                .add(
-                                                                    egui::Button::new(
-                                                                        RichText::new("Pause")
-                                                                            .color(apple_orange)
-                                                                            .strong(),
-                                                                    )
-                                                                    .fill(Color32::from_rgb(
-                                                                        255, 245, 229,
-                                                                    )),
-                                                                )
-                                                                .clicked()
-                                                            {
-                                                                self.engine.pause_task(item.id);
-                                                            }
-                                                        } else if ui
-                                                            .add(
-                                                                egui::Button::new(
-                                                                    RichText::new("Resume")
-                                                                        .color(apple_blue)
-                                                                        .strong(),
-                                                                )
-                                                                .fill(Color32::from_rgb(
-                                                                    235, 244, 255,
-                                                                )),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.engine.start_task(
-                                                                &self.rt_handle,
-                                                                item.clone(),
-                                                                self.queue.clone(),
-                                                            );
-                                                        }
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    });
-                                ui.add_space(8.0);
-                            }
-                        }
-                    });
-
-                // 4. Footer Status Bar
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.label(
-                        RichText::new(&self.footer_status)
-                            .size(11.5)
-                            .color(text_secondary),
-                    );
-                });
-            });
-
-        // Modal Dialog: Refresh Expired Download Link (Fix Link)
-        if let Some(target_id) = self.fix_link_target_id {
-            let mut open = true;
-            egui::Window::new("Refresh Expired Download Link")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label(
-                        "Paste a fresh CDN URL or mirror to resume from the exact byte offset without losing downloaded data:",
-                    );
-                    ui.add_space(6.0);
-                    ui.add_sized(
-                        [440.0, 28.0],
-                        egui::TextEdit::singleline(&mut self.fix_link_input),
-                    );
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Update Link & Resume")
-                                        .color(Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(apple_blue),
-                            )
-                            .clicked()
-                        {
-                            let new_url = self.fix_link_input.trim().to_string();
-                            if new_url.starts_with("http") {
-                                let mut updated_item = None;
-                                if let Ok(mut list) = self.queue.lock() {
-                                    if let Some(it) = list.iter_mut().find(|i| i.id == target_id) {
-                                        it.url = new_url;
-                                        updated_item = Some(it.clone());
-                                    }
-                                    QueueStorage::save_queue(&list);
-                                }
-                                if let Some(it) = updated_item {
-                                    self.engine.start_task(
-                                        &self.rt_handle,
-                                        it,
-                                        self.queue.clone(),
-                                    );
-                                }
-                            }
-                            self.fix_link_target_id = None;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.fix_link_target_id = None;
-                        }
-                    });
-                });
-            if !open {
-                self.fix_link_target_id = None;
-            }
+        if let Ok(json) = serde_json::to_string(&snap) {
+            let js = format!("if (window.renderChromeState) window.renderChromeState({});", json);
+            let _ = chrome_wv.evaluate_script(&js);
         }
-    }
+    };
+
+    layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => {
+                layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+            }
+
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                let to_save: Vec<SavedTab> = tabs
+                    .iter()
+                    .filter(|t| !t.incognito)
+                    .map(|t| SavedTab {
+                        title: t.title.clone(),
+                        url: t.url.clone(),
+                    })
+                    .collect();
+                BrowserStorage::save_session(&to_save);
+                *control_flow = ControlFlow::Exit;
+            }
+
+            Event::UserEvent(AppEvent::RefreshChrome) => {
+                push_chrome_state(
+                    &chrome_wv,
+                    &tabs,
+                    active_tab_idx,
+                    &site_policies,
+                    &global_settings,
+                    blocked_count,
+                    &sniffed_streams,
+                    &bookmarks,
+                    &history,
+                    &engine,
+                );
+            }
+
+            Event::UserEvent(AppEvent::DownloadIntercepted(dl_url)) => {
+                let ref_url = tabs.get(active_tab_idx).map(|t| t.url.clone());
+                engine.enqueue(&rt_handle, dl_url, global_settings.default_threads, ref_url, None);
+                drawer_open = true;
+                layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+                let _ = chrome_wv.evaluate_script("toggleDrawer('downloads');");
+                push_chrome_state(
+                    &chrome_wv,
+                    &tabs,
+                    active_tab_idx,
+                    &site_policies,
+                    &global_settings,
+                    blocked_count,
+                    &sniffed_streams,
+                    &bookmarks,
+                    &history,
+                    &engine,
+                );
+            }
+
+            Event::UserEvent(AppEvent::NewWindowBlockedOrOpened(popup_url)) => {
+                let lower = popup_url.to_ascii_lowercase();
+                let is_ad_popup = lower.contains("popads")
+                    || lower.contains("popcash")
+                    || lower.contains("doubleclick")
+                    || lower.contains("propellerads");
+                if global_settings.block_popups && is_ad_popup {
+                    blocked_count += 1;
+                } else if popup_url.starts_with("http") {
+                    let clean = sanitize_url(&popup_url, global_settings.strip_tracking_params);
+                    let host = extract_host(&clean);
+                    let pol = site_policies.get(&host).cloned().unwrap_or_default();
+                    let tid = next_tab_id.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(wv) = create_tab_webview(&window, tid, &clean, &pol, &global_settings, proxy.clone(), drawer_open) {
+                        tabs.push(BrowserTab {
+                            id: tid,
+                            title: clean.clone(),
+                            url: clean,
+                            incognito: false,
+                            webview: wv,
+                        });
+                        active_tab_idx = tabs.len() - 1;
+                        layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+                    }
+                }
+                push_chrome_state(
+                    &chrome_wv,
+                    &tabs,
+                    active_tab_idx,
+                    &site_policies,
+                    &global_settings,
+                    blocked_count,
+                    &sniffed_streams,
+                    &bookmarks,
+                    &history,
+                    &engine,
+                );
+            }
+
+            Event::UserEvent(AppEvent::ContentIpc(tab_id, msg)) => {
+                if msg == "AD_BLOCKED" {
+                    blocked_count += 1;
+                } else if let Some(stream_url) = msg.strip_prefix("STREAM:") {
+                    if !sniffed_streams.iter().any(|s| s == stream_url) {
+                        sniffed_streams.insert(0, stream_url.to_string());
+                        if sniffed_streams.len() > 25 {
+                            sniffed_streams.truncate(25);
+                        }
+                    }
+                } else if let Some(meta_json) = msg.strip_prefix("META:") {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(meta_json) {
+                        let title = val.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let url = val.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if let Some(tab) = tabs.iter_mut().find(|t| t.id == tab_id) {
+                            if !title.is_empty() {
+                                tab.title = title.clone();
+                            }
+                            if !url.is_empty() {
+                                tab.url = url.clone();
+                                if !tab.incognito {
+                                    let now = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    history.insert(
+                                        0,
+                                        HistoryEntry {
+                                            title: if title.is_empty() { url.clone() } else { title },
+                                            url,
+                                            visited_at: now,
+                                        },
+                                    );
+                                    BrowserStorage::save_history(&history);
+                                }
+                            }
+                        }
+                    }
+                }
+                push_chrome_state(
+                    &chrome_wv,
+                    &tabs,
+                    active_tab_idx,
+                    &site_policies,
+                    &global_settings,
+                    blocked_count,
+                    &sniffed_streams,
+                    &bookmarks,
+                    &history,
+                    &engine,
+                );
+            }
+
+            Event::UserEvent(AppEvent::ChromeIpc(cmd)) => {
+                if let Some(open_flag) = cmd.strip_prefix("DRAWER_OPEN:") {
+                    drawer_open = open_flag == "1";
+                    layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+                } else if cmd == "BACK" {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let _ = tab.webview.evaluate_script("history.back();");
+                    }
+                } else if cmd == "FORWARD" {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let _ = tab.webview.evaluate_script("history.forward();");
+                    }
+                } else if cmd == "RELOAD" {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let _ = tab.webview.evaluate_script("location.reload();");
+                    }
+                } else if let Some(raw_nav) = cmd.strip_prefix("NAV:") {
+                    let clean = sanitize_url(raw_nav, global_settings.strip_tracking_params);
+                    sniffed_streams.clear();
+                    if let Some(tab) = tabs.get_mut(active_tab_idx) {
+                        tab.url = clean.clone();
+                        let _ = tab.webview.load_url(&clean);
+                    }
+                } else if cmd == "NEW_TAB" || cmd == "NEW_INCOGNITO" {
+                    let is_incog = cmd == "NEW_INCOGNITO";
+                    let start = "https://duckduckgo.com".to_string();
+                    let pol = SitePolicy::default();
+                    let tid = next_tab_id.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(wv) = create_tab_webview(&window, tid, &start, &pol, &global_settings, proxy.clone(), drawer_open) {
+                        tabs.push(BrowserTab {
+                            id: tid,
+                            title: if is_incog { "Private Tab".to_string() } else { "New Tab".to_string() },
+                            url: start,
+                            incognito: is_incog,
+                            webview: wv,
+                        });
+                        active_tab_idx = tabs.len() - 1;
+                        layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+                    }
+                } else if let Some(idx_str) = cmd.strip_prefix("SWITCH_TAB:") {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if idx < tabs.len() {
+                            active_tab_idx = idx;
+                            layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+                        }
+                    }
+                } else if let Some(idx_str) = cmd.strip_prefix("CLOSE_TAB:") {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if tabs.len() > 1 && idx < tabs.len() {
+                            tabs.remove(idx);
+                            if active_tab_idx >= tabs.len() {
+                                active_tab_idx = tabs.len() - 1;
+                            }
+                            layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+                        }
+                    }
+                } else if cmd == "TOGGLE_BG_AUDIO" {
+                    global_settings.background_youtube_play = !global_settings.background_youtube_play;
+                    BrowserStorage::save_global_settings(&global_settings);
+                } else if let Some(gkey) = cmd.strip_prefix("TOGGLE_GLOBAL:") {
+                    match gkey {
+                        "bg_audio" => global_settings.background_youtube_play = !global_settings.background_youtube_play,
+                        "strip_tracking" => global_settings.strip_tracking_params = !global_settings.strip_tracking_params,
+                        "block_popups" => global_settings.block_popups = !global_settings.block_popups,
+                        _ => {}
+                    }
+                    BrowserStorage::save_global_settings(&global_settings);
+                } else if let Some(skey) = cmd.strip_prefix("TOGGLE_SITE:") {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let host = extract_host(&tab.url);
+                        let pol = site_policies.entry(host.clone()).or_default();
+                        match skey {
+                            "adblock" => pol.adblock = !pol.adblock,
+                            "js_enabled" => pol.js_enabled = !pol.js_enabled,
+                            "images_enabled" => pol.images_enabled = !pol.images_enabled,
+                            "desktop_ua" => pol.desktop_ua = !pol.desktop_ua,
+                            "oled_dark" => pol.oled_dark = !pol.oled_dark,
+                            "sponsorblock" => pol.sponsorblock = !pol.sponsorblock,
+                            "auto_reject_cookies" => pol.auto_reject_cookies = !pol.auto_reject_cookies,
+                            _ => {}
+                        }
+                        let updated_pol = pol.clone();
+                        BrowserStorage::save_site_policies(&site_policies);
+
+                        // Recreate tab WebView with updated site policy & reload
+                        let current_url = tab.url.clone();
+                        let is_incog = tab.incognito;
+                        let tid = next_tab_id.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(new_wv) = create_tab_webview(&window, tid, &current_url, &updated_pol, &global_settings, proxy.clone(), drawer_open) {
+                            tabs[active_tab_idx] = BrowserTab {
+                                id: tid,
+                                title: tab.title.clone(),
+                                url: current_url,
+                                incognito: is_incog,
+                                webview: new_wv,
+                            };
+                            layout_webviews(&window, &chrome_wv, &tabs, active_tab_idx, drawer_open);
+                        }
+                    }
+                } else if let Some(spd) = cmd.strip_prefix("SET_PLAYBACK_SPEED:") {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let js = format!("document.querySelectorAll('video,audio').forEach(m => m.playbackRate = {});", spd);
+                        let _ = tab.webview.evaluate_script(&js);
+                    }
+                } else if cmd == "READER_MODE" {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let js = r#"
+                            (function() {
+                                const text = (document.querySelector('article') || document.body).innerText;
+                                document.body.innerHTML = '<div style="max-width:720px;margin:36px auto;padding:20px;font:19px/1.7 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#1C1C1E;background:#F2F2F7;">' +
+                                    text.split('\n').filter(p => p.trim().length > 0).map(p => '<p style="margin-bottom:16px;">' + p + '</p>').join('') + '</div>';
+                            })();
+                        "#;
+                        let _ = tab.webview.evaluate_script(js);
+                    }
+                } else if let Some(query) = cmd.strip_prefix("FIND:") {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let escaped = query.replace('\\', "\\\\").replace('\'', "\\'");
+                        let js = format!("if ('{}') window.find('{}', false, false, true);", escaped, escaped);
+                        let _ = tab.webview.evaluate_script(&js);
+                    }
+                } else if cmd == "FIND_NEXT" || cmd == "FIND_PREV" {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let backwards = if cmd == "FIND_PREV" { "true" } else { "false" };
+                        let js = format!("window.find('', false, {}, true);", backwards);
+                        let _ = tab.webview.evaluate_script(&js);
+                    }
+                } else if cmd == "ADD_BOOKMARK" {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        if !bookmarks.iter().any(|b| b.url == tab.url) {
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                            bookmarks.insert(0, BookmarkEntry {
+                                title: tab.title.clone(),
+                                url: tab.url.clone(),
+                                created_at: now,
+                            });
+                            BrowserStorage::save_bookmarks(&bookmarks);
+                        }
+                    }
+                } else if let Some(idx_str) = cmd.strip_prefix("DEL_BOOKMARK:") {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if idx < bookmarks.len() {
+                            bookmarks.remove(idx);
+                            BrowserStorage::save_bookmarks(&bookmarks);
+                        }
+                    }
+                } else if cmd == "EXPORT_TXT_BOOKMARKS" {
+                    let _ = BrowserStorage::export_portable_txt_bookmarks(&bookmarks);
+                } else if cmd == "IMPORT_TXT_BOOKMARKS" {
+                    let _ = BrowserStorage::import_portable_txt_bookmarks(&mut bookmarks);
+                } else if cmd == "CLEAR_HISTORY" {
+                    history.clear();
+                    BrowserStorage::save_history(&history);
+                } else if cmd == "SAVE_OFFLINE_HTML" {
+                    if let Some(tab) = tabs.get(active_tab_idx) {
+                        let safe_name = tab
+                            .title
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-')
+                            .take(40)
+                            .collect::<String>()
+                            .trim()
+                            .replace(' ', "_");
+                        let fname = if safe_name.is_empty() { "snapshot.html".to_string() } else { format!("{}.html", safe_name) };
+                        let out = BrowserStorage::downloads_root_dir().join(&fname);
+                        let _ = fs::write(
+                            out,
+                            format!("<!-- Saved Offline by Shunno Browser -->\n<meta http-equiv=\"refresh\" content=\"0;url={}\">", tab.url),
+                        );
+                    }
+                } else if cmd == "OPEN_SCRIPTS_FOLDER" {
+                    let dir = BrowserStorage::user_scripts_dir();
+                    let _ = Command::new("explorer.exe").arg(dir).spawn();
+                } else if cmd == "OPEN_DOWNLOADS_FOLDER" {
+                    let dir = BrowserStorage::downloads_root_dir();
+                    let _ = Command::new("explorer.exe").arg(dir).spawn();
+                } else if let Some(limit_str) = cmd.strip_prefix("SET_SPEED_LIMIT:") {
+                    if let Ok(bps) = limit_str.parse::<u64>() {
+                        global_settings.speed_limit_bps = bps;
+                        engine.speed_limit_bps.store(bps, Ordering::SeqCst);
+                        BrowserStorage::save_global_settings(&global_settings);
+                    }
+                } else if let Some(payload) = cmd.strip_prefix("ENQUEUE_DL:") {
+                    if let Some((threads_str, raw_urls)) = payload.split_once('|') {
+                        let threads = threads_str.parse::<usize>().unwrap_or(16);
+                        let ref_url = tabs.get(active_tab_idx).map(|t| t.url.clone());
+                        let re = Regex::new(r"\[(\d+)-(\d+)\]").unwrap();
+                        if let Some(caps) = re.captures(raw_urls) {
+                            let s_str = caps.get(1).map(|m| m.as_str()).unwrap_or("1");
+                            let e_str = caps.get(2).map(|m| m.as_str()).unwrap_or("1");
+                            if let (Ok(start), Ok(end)) = (s_str.parse::<u32>(), e_str.parse::<u32>()) {
+                                let width = s_str.len();
+                                let full_m = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                                for i in start..=end.min(start + 100) {
+                                    let num = format!("{:0width$}", i, width = width);
+                                    let expanded = raw_urls.replace(full_m, &num);
+                                    engine.enqueue(&rt_handle, expanded, threads, ref_url.clone(), None);
+                                }
+                            }
+                        } else {
+                            engine.enqueue(&rt_handle, raw_urls.to_string(), threads, ref_url, None);
+                        }
+                    }
+                } else if let Some(id_str) = cmd.strip_prefix("DL_PAUSE:") {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        engine.pause(id);
+                    }
+                } else if let Some(id_str) = cmd.strip_prefix("DL_RESUME:") {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        engine.resume_or_restart(&rt_handle, id, None);
+                    }
+                } else if let Some(payload) = cmd.strip_prefix("DL_FIX:") {
+                    if let Some((id_str, new_url)) = payload.split_once('|') {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            engine.resume_or_restart(&rt_handle, id, Some(new_url.to_string()));
+                        }
+                    }
+                } else if let Some(id_str) = cmd.strip_prefix("DL_DEL:") {
+                    if let Ok(id) = id_str.parse::<u64>() {
+                        engine.delete(id);
+                    }
+                } else if let Some(path) = cmd.strip_prefix("DL_SHOW:") {
+                    if !path.is_empty() {
+                        let _ = Command::new("explorer.exe").arg(format!("/select,{}", path)).spawn();
+                    }
+                }
+
+                push_chrome_state(
+                    &chrome_wv,
+                    &tabs,
+                    active_tab_idx,
+                    &site_policies,
+                    &global_settings,
+                    blocked_count,
+                    &sniffed_streams,
+                    &bookmarks,
+                    &history,
+                    &engine,
+                );
+            }
+
+            _ => {}
+        }
+    });
 }
